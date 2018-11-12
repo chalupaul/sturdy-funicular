@@ -3,6 +3,7 @@
 import sys
 import os
 import re
+import argparse
 import shutil
 import tempfile
 import json
@@ -16,7 +17,8 @@ if sys.version_info[0] < 3:
     input_func = raw_input
 else:
     input_func = input
-    
+
+
 auth_token = os.environ.get("SSOTOKEN")
 """auth_token (string): Set your Rackspace auth token as $SSOTOKEN
 in your shell to be included.
@@ -39,6 +41,22 @@ inventory_url = "https://index.rpc.rackspace.com/api/"
 auth token is used for this.
 """
 
+def __make_args():
+    """Makes argparse stuff.
+    
+    Returns: 
+        ArgumentParser: the args option used for decision making
+    """ 
+    parser = argparse.ArgumentParser()
+    auth_cmd = "--auth"
+    auth_help_txt = ("Just print out a Rax auth token and quit. "
+    "Useful for: export SSOTOKEN=$({} {})")
+    parser.add_argument(
+        auth_cmd,
+        help=auth_help_txt.format(sys.argv[0], auth_cmd),
+        action="store_true")
+    return parser.parse_args()
+    
 def authenticate(username, pinrsa):
     """Gather username and password from user and authenticate with them.
     If either username or password are None, it will ask the user for input.
@@ -110,6 +128,36 @@ def __find_key(needle, haystack):
                     attempt = __find_key(needle, d)
                     if attempt is not None:
                         return attempt
+
+def __guess_key(key, keys, default_value):
+    """Attempts to retrieve a key from a set of keys. There's a somewhat insane
+    amount of domain specific knowledge here. The keys often change subtley,
+    and therefore need some tweaking to find the right keys. This is extremely
+    error prone and should not be trusted. The idea is to use this to determine
+    the value in a dict, such as foo = bar[__guess_key(...)].
+    
+    Args:
+        key (string): A string to attempt to find. Generally speaking, this
+        will be one of the following, and the function will attempt to
+        find anything close to it:
+            - "source"
+            - "pws_project_id"
+            - "pws_credential_id"
+            - "type"
+        keys (List<string>): A list of strings to be searched.
+        default_value (string): If no match was found, return this string.
+    Returns:
+        string: Either the closest match or the value of default_value
+    """
+    default_value = key
+    if "cred" in key:
+        key = "credential"
+    elif "proj" in key:
+        key = "project"
+    for k in keys:
+        if key in k:
+            return k
+    return default_value
     
 def checkout_repo(repo_name):
     """Does a shallow clone from repo from the rpc-environments org into a 
@@ -128,12 +176,16 @@ def checkout_repo(repo_name):
     
     
 if __name__ == "__main__":
+    args = __make_args()
     if auth_token == None:
         uname = os.environ.get("SSOUSERNAME")
         rsa = os.environ.get("SSOPINRSA")
         auth_body = authenticate(uname, rsa)
         # This is unfortunately brittle
         auth_token = auth_body["access"]["token"]["id"]
+    if args.auth:
+        print(auth_token)
+        sys.exit(0)
         
     # There's no way to tell for sure if an environment you
     # find in git matches anything in the api because there's no uuids
@@ -142,7 +194,9 @@ if __name__ == "__main__":
     # and search for accounts and environments. This is literally the worst.
 
     inventory_headers = {"x-auth-token": auth_token,
-                        "content-type": "application/json"}
+                        "content-type": "application/json",
+                        "accept: application/vnd.rackspace.rpc.index-v1+json",
+                        "cache-control": "no-cache"}
 
     all_accounts = requests.get(
         inventory_url + "customers", 
@@ -190,16 +244,49 @@ if __name__ == "__main__":
                             environment_uuid = env["id"]
                             env_data = env
                             break
+            
             if None in [account_uuid, environment_uuid, env_data]:
                 msg = ("Unable to find information for account number: {} "
                     "environment: {}. This needs to be manually resolved.")
                 print(msg.format(account_number, environment_name))
                 continue
+            
+            unsafe_keys = vault_info.keys()
+            # This is a list of proper expected keys
+            vault_keys = [
+                "source", 
+                "pws_project_id",
+                "pws_credential_id", 
+                "type"]
+            fixed_vault_info = {}
+            # This is loop control. If we can't find all the right info in
+            # the github info, we dont store it. Let a human figure it out.
+            bad_data_detected = False
+            for vk in vault_keys:
+                clean_key = __guess_key(vk, unsafe_keys, None)
+                try:
+                    fixed_vault_info[vk] = vault_info[clean_key]
+                except KeyError as e:
+                    msg = ("Warning: vault information bad for account: {} "
+                    "environment: {}. Could not find information for {}")
+                    print(msg.format(
+                        account_number, 
+                        environment_name, 
+                        clean_key))
+                    on_fire = True
+            if bad_data_detected:
+                bad_data_detected = False
+                continue
+            
+            # ids arent sent on edits
+            env_data.pop("id", None)
+            
+            
             uri = inventory_url + "customers/{}/environments/{}".format(
                 account_uuid,
                 environment_uuid
             )
-            env_data["ansible_vault"] = vault_info
+            env_data["ansible_vault"] = fixed_vault_info
             # hold onto your butts
             r = requests.put(uri, data=json.dumps(env_data), headers=inventory_headers)
             if 200 <= r.status_code < 300:
