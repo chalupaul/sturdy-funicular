@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
     inventory_headers = {"x-auth-token": auth_token,
                         "content-type": "application/json",
-                        "accept: application/vnd.rackspace.rpc.index-v1+json",
+                        "accept": "application/vnd.rackspace.rpc.index-v1+json",
                         "cache-control": "no-cache"}
 
     all_accounts = requests.get(
@@ -237,7 +237,7 @@ if __name__ == "__main__":
             environment_uuid = None
             env_data = None
             for account in all_accounts:
-                if account["coreAccount"] == account_number:
+                if account["core_account"] == account_number:
                     account_uuid = account["id"]
                     for env in account["environments"]:
                         if env["label"] == environment_name:
@@ -255,8 +255,8 @@ if __name__ == "__main__":
             # This is a list of proper expected keys
             vault_keys = [
                 "source", 
-                "pws_project_id",
-                "pws_credential_id", 
+                "pws_project",
+                "pws_cred", 
                 "type"]
             fixed_vault_info = {}
             # This is loop control. If we can't find all the right info in
