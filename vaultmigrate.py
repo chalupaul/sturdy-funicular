@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import print_function
 
 import sys
 import os
@@ -36,7 +37,7 @@ permissions to the 'rpc-environments' repo. Token requires 'repo' access.
     https://github.com/rpc-environments
 """
 
-inventory_url = "https://index.rpc.rackspace.com/api/"
+inventory_url = "https://index-tst.rpc.rackspace.com/api/"
 """inventory_url (string): This is the url to the rpc inventory api. Your
 auth token is used for this.
 """
@@ -199,28 +200,52 @@ if __name__ == "__main__":
                         "cache-control": "no-cache"}
 
     all_accounts = requests.get(
-        inventory_url + "customers", 
-        headers=inventory_headers).json()
- 
+        inventory_url + "customers",
+        headers=inventory_headers,
+        verify="./rax_cabundle.crt").json()
+
     if git_token == None:
         git_token = getpass.getpass("Github Personal Token [full repo scope]:")
     
     github_api = Github(git_token)
-    
+
+    results = {
+        "matched_envs": [],
+        "unmatched_envs": [],
+        "unmatched_notfound_envs": [],
+        "unmatched_decom_envs": [],
+        "noenv_repos": []
+    }
+
+    repo_count = 0
+    env_count = 0
+
     for r in github_api.get_organization("rpc-environments").get_repos():
+        repo_count += 1
         account_name = r.name
         repo = checkout_repo(r.name)
         env_files = []
-        # Find environment.yml files in order to 
+        used_login_nodes = []
+        # Find environment.yml files in order to
         # tell what directory represents a repo
         for root, dirs, files in os.walk(repo):
             for name in files:
                 if name == "environment.yml":
                     env_files.append(os.path.join(root, name))
+
+        if len(env_files) < 1:
+            results['noenv_repos'].append(r.html_url)
+
         # Load files into an object and extract the vault info
         for env_file in env_files:
+            sys.stdout.write('.') # it hurts to watch a still terminal for this long
+            sys.stdout.flush()
+
+            env_count += 1
             file_explode = env_file.split('/')
             environment_name = file_explode[-2]
+            env_url = "{}/tree/master/{}/environment.yml".format(r.html_url, environment_name)
+
             env_yaml = yaml.load(open(env_file, 'r'))
             # The yaml doesn't have any deterministic keys so we
             # have to find the info we're looking for.
@@ -232,7 +257,8 @@ if __name__ == "__main__":
             account_format = re.compile('^\d+-')
             mo = account_format.search(account_name)
             account_number = int(mo.group().split('-')[0])
-            
+            core_device = __find_key('core-device', env_yaml)
+
             account_uuid = None
             environment_uuid = None
             env_data = None
@@ -240,15 +266,27 @@ if __name__ == "__main__":
                 if account["core_account"] == account_number:
                     account_uuid = account["id"]
                     for env in account["environments"]:
+                        # try to match on environment name
                         if env["label"] == environment_name:
                             environment_uuid = env["id"]
                             env_data = env
+                            used_login_nodes.append(core_device)
+                            results['matched_envs'].append((env_url, "label"))
+                            break
+                        elif core_device == env["login_node"] and core_device not in used_login_nodes:
+                            used_login_nodes.append(core_device)
+                            environment_uuid = env["id"]
+                            env_data = env
+                            results['matched_envs'].append((env_url, "CORE device"))
                             break
             
             if None in [account_uuid, environment_uuid, env_data]:
-                msg = ("Unable to find information for account number: {} "
-                    "environment: {}. This needs to be manually resolved.")
-                print(msg.format(account_number, environment_name))
+                if not account_uuid:
+                    results['unmatched_notfound_envs'].append(env_url)
+                elif __find_key('state', env_yaml) == 'decommissioned':
+                    results['unmatched_decom_envs'].append(env_url)
+                else:
+                    results['unmatched_envs'].append(env_url)
                 continue
             
             unsafe_keys = vault_info.keys()
@@ -288,15 +326,45 @@ if __name__ == "__main__":
             )
             env_data["ansible_vault"] = fixed_vault_info
             # hold onto your butts
-            r = requests.put(uri, data=json.dumps(env_data), headers=inventory_headers)
-            if 200 <= r.status_code < 300:
-                msg = "Updated account: {} environment: {} successfully."
-                print(msg.format(account_uuid, environment_uuid))
+            index_r = requests.put(uri, data=json.dumps(env_data), headers=inventory_headers, verify="./rax_cabundle.crt")
+            if 200 <= index_r.status_code < 300:
+                continue
+                # msg = "Updated account: {} environment: {} successfully."
+                # print(msg.format(account_uuid, environment_uuid))
             else:
                 msg = ("Unexpected error from inventory api when sending"
                 "account: {} environment: {} : ")
-                print(msg.format(account_number, environment_name) + r.text)
+                print(msg.format(account_number, environment_name) + index_r.text)
         shutil.rmtree(repo)
 
-            
-        
+    print("\n\nMatched environments (by method) ({}/{}):".format(len(results['matched_envs']), env_count))
+    for env, method in results['matched_envs']:
+        print("{: >11} - {}".format(method, env))
+
+    print("\nUnmatched environments - no matching account number in API ({}/{}):".format(len(results['unmatched_notfound_envs']), env_count))
+    for env in results['unmatched_notfound_envs']:
+        print(env)
+
+    print("\nUnmatched environments marked decom ({}/{}):".format(len(results['unmatched_decom_envs']), env_count))
+    for env in results['unmatched_decom_envs']:
+        print(env)
+
+    print("\nUnmatched environments (needs investigation) ({}/{}):".format(len(results['unmatched_envs']), env_count))
+    for env in results['unmatched_envs']:
+        print(env)
+
+    print("\nRepos with no environment.yml (needs investigation) ({}/{}):".format(len(results['noenv_repos']), repo_count))
+    for repo in results['noenv_repos']:
+        print(repo)
+
+    all_accounts = requests.get(
+        inventory_url + "customers",
+        headers=inventory_headers,
+        verify="./rax_cabundle.crt").json()
+
+    print("\nEnvironments from API with no ansible_vault entry:")
+    for account in all_accounts:
+        for env in account['environments']:
+            if 'ansible_vault' not in env.keys():
+                envlink = "{}customers/{}/environments/{}".format(inventory_url, account['id'], env['id'])
+                print("{:<25} {:<15}: {}".format(account['name'], env['label'], envlink))
